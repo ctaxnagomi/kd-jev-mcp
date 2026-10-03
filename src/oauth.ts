@@ -95,6 +95,64 @@ async function readForm(request: Request): Promise<URLSearchParams> {
   return new URLSearchParams(await request.text());
 }
 
+/**
+ * Read a body into a plain record that keeps arrays as arrays.
+ *
+ * `readForm` is wrong for DCR, and using it there silently broke client
+ * registration. It returns a `URLSearchParams`, whose values live in a private
+ * internal list rather than on properties, so `body.redirect_uris` is always
+ * `undefined` no matter what the client sent. Casting that to
+ * `Record<string, unknown>` hides the mistake from the compiler, and the
+ * observable effect was that `/register` answered
+ * `invalid_redirect_uri: at least one redirect_uri is required` to *every*
+ * request, including a well-formed JSON one -- meaning no MCP client could
+ * complete a dynamic registration and the whole OAuth path was unusable in
+ * practice.
+ *
+ * RFC 7591 says the body is JSON, but clients in the wild also send
+ * form-encoded bodies where array-valued members are JSON text. Both shapes are
+ * accepted here, plus repeated keys (`redirect_uris=a&redirect_uris=b`), which
+ * is how a form encoder with no JSON support expresses a list.
+ */
+async function readRecord(request: Request): Promise<Record<string, unknown>> {
+  const type = (request.headers.get("content-type") || "").toLowerCase();
+  if (type.includes("application/json")) {
+    try {
+      const body = (await request.json()) as unknown;
+      return body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  }
+
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of new URLSearchParams(await request.text())) {
+    // A repeated key means a list; the last-one-wins reading would drop values.
+    if (key in out) {
+      out[key] = (Array.isArray(out[key]) ? out[key] : [out[key]]) .concat(value);
+      continue;
+    }
+    // Unwrap JSON-encoded members so form and JSON bodies converge on one shape.
+    if (value.startsWith("[") || value.startsWith("{")) {
+      try {
+        out[key] = JSON.parse(value);
+        continue;
+      } catch {
+        /* not JSON after all -- fall through to the raw string */
+      }
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+/** Coerce a client-supplied member to `string[]`, tolerating a lone string. */
+function stringArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((x): x is string => typeof x === "string");
+  if (typeof value === "string") return [value];
+  return [];
+}
+
 function oauthError(error: string, description: string, status = 400): Response {
   return json({ error, error_description: description }, { status, headers: { "cache-control": "no-store" } });
 }
@@ -110,8 +168,8 @@ function oauthError(error: string, description: string, status = 400): Response 
 export async function handleRegister(env: Env, request: Request): Promise<Response> {
   if (request.method !== "POST") return oauthError("invalid_request", "registration requires POST", 405);
 
-  const body = (await readForm(request)) as unknown as Record<string, any>;
-  const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
+  const body = await readRecord(request);
+  const redirectUris = stringArray(body.redirect_uris);
 
   if (redirectUris.length === 0) {
     return oauthError("invalid_redirect_uri", "at least one redirect_uri is required");
@@ -134,8 +192,8 @@ export async function handleRegister(env: Env, request: Request): Promise<Respon
     }
   }
 
-  const grantTypes: string[] = Array.isArray(body.grant_types)
-    ? body.grant_types.filter((x: unknown): x is string => typeof x === "string")
+  const grantTypes: string[] = stringArray(body.grant_types).length
+    ? stringArray(body.grant_types)
     : ["authorization_code", "refresh_token"];
   for (const g of grantTypes) {
     if (g !== "authorization_code" && g !== "refresh_token") {

@@ -14,6 +14,15 @@ operator ───► /admin (token dashboard)      ┘                        (
 liveness ───► /health
 ```
 
+> **Licensing status — read before operating this for others.**
+> TypeSafe's [Interface terms](https://typesafe.ai/terms) grant API access
+> "solely for the purpose of evaluating", forbid sharing access credentials
+> with third parties, and forbid using the interfaces "to provide any product
+> or service to a third party". Running this gateway as a multi-tenant service
+> therefore needs TypeSafe's permission, which has been requested and not yet
+> granted. Self-hosting it for your own team or invited collaborators is within
+> the terms as written. See [`docs/TYPESAFE-PERMISSION-REQUEST.md`](docs/TYPESAFE-PERMISSION-REQUEST.md).
+
 ## The three primitives
 
 JEV returns typed decisions instead of prose. The whole product is these three:
@@ -99,6 +108,28 @@ npm run deploy
 ```
 
 Then open `/admin` and sign in with `ADMIN_PASSKEY`.
+
+## Tests
+
+Both suites run against a live `wrangler dev` on `127.0.0.1:8787` and need the
+secrets from `.dev.vars` in the environment.
+
+```bash
+npm run dev          # in one shell
+npm run typecheck
+npm run smoke        # data plane: tokens, quota, JEV primitives, MCP protocol
+npm run oauth        # authorization plane: DCR, consent, PKCE, refresh, revoke
+```
+
+`npm run smoke` covers the gateway: token issuance and rotation, all three JEV
+primitives against the live API, the MCP handshake, rate limiting, quota
+exhaustion, revocation, and the admin surfaces.
+
+`npm run oauth` covers the OAuth 2.1 authorization plane a MCP host walks at
+connect time: the RFC 9728 / RFC 8414 discovery documents, the RFC 9724 401
+challenge, dynamic client registration, consent, the PKCE S256 exchange,
+single-use authorization codes, refresh rotation, revocation, and the cascade
+where revoking a gateway token kills the OAuth sessions derived from it.
 
 ## Admin dashboard
 

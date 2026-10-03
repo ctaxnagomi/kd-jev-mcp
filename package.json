@@ -9,6 +9,7 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "smoke": "node scripts/smoke.mjs",
+    "oauth": "node scripts/oauth.mjs",
     "migrate:local": "wrangler d1 migrations apply kd-jev-mcp --local",
     "migrate:remote": "wrangler d1 migrations apply kd-jev-mcp --remote"
   },
