@@ -1,0 +1,24 @@
+{
+  "name": "kd-jev-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "KD JEV MCP - an authenticated MCP gateway to the TypeSafe JEV System One reasoning API, with per-user D1-backed rate limits, quotas and audit logs.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "smoke": "node scripts/smoke.mjs",
+    "migrate:local": "wrangler d1 migrations apply kd-jev-mcp --local",
+    "migrate:remote": "wrangler d1 migrations apply kd-jev-mcp --remote"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261001.1",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.131.1"
+  }
+}

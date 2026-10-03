@@ -1,0 +1,50 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "kd-jev-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-05-01",
+  "observability": {
+    "enabled": true
+  },
+
+  // ---------------------------------------------------------------------
+  // PLACEHOLDER database_id -- must be replaced before `wrangler deploy`.
+  //
+  // The authenticated Cloudflare session on this machine can read D1 but
+  // returns "Authentication error [10000]" on create/update, so the real
+  // database could not be provisioned yet. All-zeros is used deliberately:
+  // it is guaranteed invalid, so a forgotten replacement fails loudly at
+  // deploy time instead of silently binding someone else's database.
+  //
+  // Create it with either:
+  //   npx wrangler d1 create kd-jev-mcp
+  // or the Cloudflare dashboard / API, then paste the returned uuid here.
+  // ---------------------------------------------------------------------
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "kd-jev-mcp",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+
+  "vars": {
+    // Upstream JEV endpoint and model. The API key itself is a secret
+    // (JEV_API_KEY), never a var -- see README "Secrets".
+    "JEV_ENDPOINT": "https://api.typesafe.ai",
+    "JEV_MODEL": "jev-latest",
+
+    // Hard ceiling on how many tokens can ever be active at once.
+    // Enforced server-side in handleCreateToken; also surfaced in the
+    // admin dashboard so the operator can see the headroom.
+    "MAX_USERS": "100",
+
+    // Default allowance applied to newly generated tokens.
+    "DEFAULT_QUOTA_MONTHLY": "1000",
+    "DEFAULT_RATE_PER_MIN": "60",
+
+    // Length of a quota period in days. Quota is reset lazily on first use
+    // after the window elapses, so no cron is required.
+    "QUOTA_PERIOD_DAYS": "30"
+  }
+}
