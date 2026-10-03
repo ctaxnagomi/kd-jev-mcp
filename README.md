@@ -278,7 +278,8 @@ Enforced in `src/jev.ts` because **JEV bills per question**, so batch size is th
 ```
 src/
   index.ts    router, MCP server, REST mirror, admin API
-  auth.ts     token resolution (master secret, then D1 hash lookup), admin gate
+  oauth.ts    OAuth 2.1 authorization server (DCR, PKCE, consent, revocation)
+  auth.ts     credential resolution (master secret → OAuth grant → token hash), admin gate
   quota.ts    conditional-UPDATE quota + burst limiter, usage snapshot
   jev.ts      upstream proxy, question validation, answer normalisation
   admin.ts    dashboard (single page, no build step)
@@ -286,7 +287,46 @@ src/
   util.ts     hashing, base32 token generation, constant-time compare
 migrations/
   0001_init.sql   tokens, usage_events, audit_logs
+  0002_oauth.sql  oauth_clients, oauth_grants, oauth_access_tokens
+docs/
+  AGENT-CATALOGUE.md     configurations A–C: orchestrator, planner, swarm, research,
+                         tool orchestrator, policy gate, dual expert — with SWOT + SPACE
+  AGENT-ROLES.md         roles D1–D12: debugger through tax filing to the tools router
+  FABRICATOR-INTAKE.md   the /Fabri-Jev first-run interview and agent proposal
+  TYPESAFE-PERMISSION-REQUEST.md   the licensing ask that unblocks monetisation
+scripts/
+  smoke.mjs    73 assertions, end-to-end
+  oauth.mjs    99 assertions, OAuth 2.1 conformance
 ```
+
+## Design docs
+
+The gateway is deliberately *thin* — it proxies decisions and does not generate
+text. Everything built on top of it therefore has one invariant:
+
+> **The LLM generates. JEV decides.**
+
+JEV returns typed decisions with calibrated confidence. It never writes prose,
+code, or plans. So every agent is specified as a pair: what the model is
+accountable for, and which of JEV's four roles it is wired into — **router**,
+**gate**, **arbiter**, or **verifier**.
+
+| Document | What it holds |
+|---|---|
+| [`docs/AGENT-CATALOGUE.md`](docs/AGENT-CATALOGUE.md) | Configurations **A** (orchestrator + execution layer), **B** (planner + swarm), **C** (research, tool orchestrator, policy gate, dual expert). Each with concrete question payloads, search/scrape behaviour, permissions, SWOT, and a SPACE matrix resolving to explicit decisions. |
+| [`docs/AGENT-ROLES.md`](docs/AGENT-ROLES.md) | The twelve role agents **D1–D12** in the same shape, plus a progressive-enablement order ranked by risk retired per unit of capability, and ten cross-cutting rules. |
+| [`docs/FABRICATOR-INTAKE.md`](docs/FABRICATOR-INTAKE.md) | The `/Fabri-Jev` interview: a four-round design tree with a recommended answer per question, four JEV gates inside the intake itself, the DDL for agents and proposals, and the checkmarked proposal table. |
+| [`docs/TYPESAFE-PERMISSION-REQUEST.md`](docs/TYPESAFE-PERMISSION-REQUEST.md) | The three Interface-terms clauses that block multi-tenant operation, the mitigations for each, and six answerable questions. |
+
+Two things worth reading before building on these:
+
+- **The `tier` field.** Every agent is `local` (your workspace, your token) or
+  `hosted` (shared multi-tenant). `local` is within the Interface terms as
+  written. `hosted` is not, and the Fabricator **refuses to create** hosted
+  agents until the permission request is answered.
+- **SPACE ratings are design aids, not validation.** They are a way of forcing
+  the trade-offs into the open and recording the resulting decisions. They are
+  not measured data, and nothing in the system should treat them as such.
 
 ## Security notes
 
