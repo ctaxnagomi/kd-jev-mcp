@@ -16,6 +16,13 @@ export interface Env {
   DEFAULT_QUOTA_MONTHLY: string;
   DEFAULT_RATE_PER_MIN: string;
   QUOTA_PERIOD_DAYS: string;
+
+  /**
+   * Recurring KD Credit allowance handed to a new seat, in whole credits.
+   * Optional -- falls back to `credit_settings.default_credits` when unset, and
+   * to the server default when that row is missing too.
+   */
+  DEFAULT_CREDITS?: string;
 }
 
 export type TokenStatus = "active" | "disabled";
@@ -35,6 +42,17 @@ export interface TokenRow {
   last_used_at: number | null;
   created_at: number;
   updated_at: number;
+
+  // ----------------------------------------------------------- credit balance
+  // All in MICRO-credits (1 KD Credit = 1,000,000). Split into a recurring grant
+  // that resets with the window and a top-up that never does, so a top-up
+  // cannot be silently eaten by the next reset.
+  credits_granted: number;
+  credits_used: number;
+  credits_extra: number;
+
+  /** Lifetime JEV input+output tokens. Admin-only; reconciles against the invoice. */
+  jev_tokens_lifetime: number;
 }
 
 /** How a caller proved who they are. Surfaced by `whoami` and the audit log. */

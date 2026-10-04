@@ -5,11 +5,16 @@ Cloudflare Workers.
 
 Clients hold a `kdj_…` gateway token. The shared JEV API key stays on the server and is injected
 per request — a client can never read it, and a leaked gateway token is revocable with one row
-update. Behind the gateway sit per-token quota, a per-token burst limiter, and an operator audit log.
+update. Behind the gateway sit a **KD Credit balance**, a per-token burst limiter, and an operator
+audit log.
+
+The service is **free to users**. Credits are the internal unit: users see a balance, never a price,
+and the operator converts it to MYR or USD to reconcile against the JEV invoice. See
+[KD Credit](#kd-credit--the-balance).
 
 ```
 MCP client ──► /mcp  (Streamable HTTP MCP) ─┐
-curl / CI ──► /api/*  (REST mirror)         ├─► D1 quota gate ──► TypeSafe /v1/systemone
+curl / CI ──► /api/*  (REST mirror)         ├─► D1 credit gate ──► TypeSafe /v1/systemone
 operator ───► /admin (token dashboard)      ┘                        (shared JEV_API_KEY)
 liveness ───► /health
 ```
@@ -48,7 +53,8 @@ Every answer is normalised to one shape, so a client never branches on which pri
 | `choice` | One `choice` question. |
 | `noul` | One `noul` question. |
 | `score` | One `score` question. |
-| `usage` | Remaining quota, burst headroom, lifetime JEV token spend. |
+| `usage` | KD Credit balance, operational health, burst headroom, call counts. |
+| `token_health` | One-word verdict — `active` / `idle` / `degraded` / `exhausted` / `revoked` — with the remedy. |
 | `help` | Self-describing usage notes. |
 
 `reason` is the one to reach for by default. TypeSafe's own guidance is to ask many narrow,
@@ -68,7 +74,7 @@ npm install
 ```bash
 npx wrangler secret put JEV_API_KEY      # shared TypeSafe JEV key — never exposed to clients
 npx wrangler secret put ADMIN_PASSKEY    # gates /admin and /api/admin/*
-npx wrangler secret put MCP_TOKEN        # optional break-glass master token, bypasses D1 + quota
+npx wrangler secret put MCP_TOKEN        # optional break-glass master token, bypasses D1 metering
 ```
 
 For local development put the same three in `.dev.vars` (gitignored):
@@ -117,13 +123,14 @@ secrets from `.dev.vars` in the environment.
 ```bash
 npm run dev          # in one shell
 npm run typecheck
-npm run smoke        # data plane: tokens, quota, JEV primitives, MCP protocol
+npm run smoke        # data plane: tokens, credits, JEV primitives, MCP protocol
 npm run oauth        # authorization plane: DCR, consent, PKCE, refresh, revoke
 ```
 
 `npm run smoke` covers the gateway: token issuance and rotation, all three JEV
-primitives against the live API, the MCP handshake, rate limiting, quota
-exhaustion, revocation, and the admin surfaces.
+primitives against the live API, the MCP handshake, rate limiting, the credit
+lifecycle (grant → debit → exhaustion → top-up → resume), health states, the
+absence of any price on the user surface, revocation, and the admin surfaces.
 
 `npm run oauth` covers the OAuth 2.1 authorization plane a MCP host walks at
 connect time: the RFC 9728 / RFC 8414 discovery documents, the RFC 9724 401
@@ -135,9 +142,12 @@ where revoking a gateway token kills the OAuth sessions derived from it.
 
 `/admin`, gated by `ADMIN_PASSKEY` (constant-time compared, fails closed when unset).
 
-- **Generate API token** — email, label, monthly quota, req/min. Returns the token **once**.
-- **Tokens tab** — status, quota bar, burst ceiling, last used. Revoke / enable / edit / rotate.
-- **Audit log tab** — every issuance, rotation, revocation and failed admin login, with IP.
+- **Generate API token** — email, label, **KD Credit grant**, req/min, and an optional request cap.
+  Returns the token **once**.
+- **Tokens tab** — health pill, credit bar, available **MYR** and **USD**, lifetime JEV tokens, last
+  used. Revoke / enable / top up / edit / rotate.
+- **Credit settings tab** — the KD Credit → MYR / USD conversion rates, editable without a redeploy.
+- **Audit log tab** — every issuance, rotation, revocation, top-up and failed admin login, with IP.
 
 The admin passkey is accepted from the `x-admin-passkey` header or the JSON body. It is
 deliberately **not** accepted as a query parameter, which would leak it into access logs and browser
@@ -159,25 +169,131 @@ Consequences, all deliberate:
 every issuance. Re-issuing or rotating for an **existing** holder does not consume a seat, so
 replacing a lost token never trips the limit. Admins can revoke a seat to free it.
 
-## Quota and rate limiting
+## KD Credit — the balance
 
-Two independent limits, both enforced by a **conditional UPDATE** rather than read-then-write:
+The service is free to its users. It is not free to operate: TypeSafe bills on input and output
+tokens, so *"what has this seat cost me"* has a real answer that someone needs to see.
 
-```sql
-UPDATE tokens SET requests_used = requests_used + 1
- WHERE id = ? AND status = 'active' AND requests_used < quota_monthly
+**KD Credit** is the unit that answers both questions. A seat is granted an amount of it, JEV calls
+debit it by their real token usage, and the operator reads the balance as MYR or USD. Users see only
+the credit figure.
+
+```
+granted  500 KD Credit
+  spent  0.146   (one call, 292 JEV tokens)
+  left   499.854
+         ≈ RM 2.35   ≈ $0.50
 ```
 
-That matters under concurrency. Two simultaneous requests that both read `requests_used = 999` of a
-1000 quota would each allow themselves and overshoot. Putting the predicate in the `WHERE` clause
+### Two surfaces, two currencies
+
+| | user (`usage`, `/api/usage`) | admin (`/admin`, `/api/admin/*`) |
+|---|---|---|
+| KD Credit | yes | yes |
+| MYR / USD | **never** | yes |
+| JEV token total | no | yes |
+
+The split is load-bearing, not cosmetic. Since the user surface never states a price or a rate, the
+exchange rate can be restated from the dashboard without any client needing to know. A smoke test
+asserts `myr`, `usd` and `micros` are absent from the user payload — the rule would otherwise rot
+the first time someone helpfully added a column.
+
+### Debit happens *after* the call, not before
+
+A call's cost is not knowable until upstream reports its token usage. So the flow is:
+
+1. **Pre-flight** — is `available > 0`? Refuse with `429 credit_exhausted` if not.
+2. **Call** JEV.
+3. **Debit** the actual cost, with the balance allowed to go negative.
+
+The negative case is intentional. A seat with 0.3 credit left may start a call that costs more than
+that. Clamping the debit to zero would be a tidy lie: the ledger would stop reconciling against the
+upstream invoice, and the overspend would vanish precisely when it mattered. The real cost is
+recorded, and the *next* call is the one that gets blocked — which is where the user actually needs
+to stop. One call's worth of overshoot is the entire exposure.
+
+The debit is **not** a conditional UPDATE, unlike the request counter. By the time the cost is known
+it has already been paid upstream; refusing to record it would not save the money.
+
+### Why micro-credits
+
+Credits are stored as integers in **micro**-credits (1 KD Credit = 1,000,000). A typical call costs a
+*fraction* of a credit, so rounding each debit to a whole credit would overstate real spend by up to
+100% on small calls and would never reconcile against the invoice. Micro precision puts the rounding
+error at ~1e-6 of a credit per call.
+
+Debits round **up**, always. Rounding down would systematically undercharge, and the shortfall would
+accumulate in the operator's favour without ever surfacing as an error.
+
+### Two kinds of credit, deliberately separate
+
+| Column | Resets monthly? | Set by |
+|---|---|---|
+| `credits_granted` | yes, lazily with the window | generate form, or edited |
+| `credits_extra` | **never** | top-up only |
+| `credits_used` | yes | debited per call |
+
+A top-up that vanished at the next reset is how operators stop trusting a balance, so top-ups go to
+`credits_extra` and are never reset. The dashboard says so at the prompt.
+
+The window rolls forward **lazily on first use**, so there is no cron to keep alive and no seat is
+charged for a window that lapsed while idle.
+
+### Health
+
+`token_health` reports one word, ordered deliberately:
+
+| State | Meaning |
+|---|---|
+| `revoked` | Revoked. Checked **first** — a revoked seat with credits left is still revoked. |
+| `exhausted` | Balance at or below zero. Cannot call. |
+| `degraded` | Under `degraded_pct` (default 20%) of its allowance. **Still callable.** |
+| `idle` | Has allowance, never used — possibly a broken integration. |
+| `active` | Healthy. |
+
+`degraded` does not block. Refusing a call because someone is 3% short would be hostile and would not
+save meaningful money. `idle` is separate from `active` because those need different operator
+responses: one may be a broken integration, the other is simply working.
+
+Each state carries a `remedy` string. A verdict without a remedy makes the caller guess between
+"wait", "pay", and "ask someone".
+
+### Reconfiguring the economy
+
+Rates live in D1 (`credit_settings`), not `wrangler.jsonc`, so exchange rates can be restated from the
+dashboard without a redeploy.
+
+`tokens_per_credit` is **refused** once any seat has spent credit. Changing it would silently
+restate the value of every existing balance — a 500-credit grant would quietly become 250, with every
+number still looking plausible. Making that easy would be making a data-integrity bug easy.
+
+**The shipped rates are placeholders.** Set them to reconcile against your own JEV invoice.
+
+## Rate limiting
+
+A per-token burst ceiling, enforced by a **conditional UPDATE** rather than read-then-write:
+
+```sql
+UPDATE tokens SET rate_count = rate_count + 1
+ WHERE id = ? AND rate_window = ? AND rate_count < rate_limit_per_min
+RETURNING rate_count
+```
+
+That matters under concurrency. Two simultaneous requests that both read `rate_count = 59` of a
+60/min limit would each allow themselves and overshoot. Putting the predicate in the `WHERE` clause
 makes the database the arbiter: the increment succeeds for exactly one of them, or for neither.
 
-The monthly window resets **lazily on first use** after it elapses, so there is no cron to keep
-alive and no user is charged for a window that lapsed while idle.
+There are two controls, and they do different jobs:
 
-**Quota is charged per tool call, not per HTTP request.** MCP clients send `initialize` and
-`tools/list` on nearly every session; charging those would burn a user's allowance without ever
-reaching JEV. `usage` is free, so a client can always see its own allowance.
+- **Rate limit** — caps the instantaneous burst.
+- **Credit balance** — caps total spend.
+
+A third limit on request count is available (`quota_monthly`) as an optional blast-radius guard, and
+defaults to **0 = off**. Three overlapping spend limits only obscure which one bit.
+
+**Credits are charged per tool call, not per HTTP request.** MCP clients send `initialize` and
+`tools/list` on nearly every session; charging those would burn a seat's allowance without ever
+reaching JEV. `usage` and `token_health` are free, so a client can always see its own position.
 
 The master `MCP_TOKEN` bypasses the gate entirely. It is the operator's break-glass and is not one
 of the metered seats.
@@ -213,7 +329,7 @@ claude mcp add --transport http kd-jev https://<worker>/mcp
 ChatGPT and other hosts that follow the MCP OAuth profile work against the same
 endpoints with no extra configuration. Identity during consent is the holder's
 own `kdj_…` token, so an OAuth grant and a pasted bearer token resolve to the
-same quota and usage history.
+same KD Credit balance and usage history.
 
 **Revoking a token kills every OAuth session derived from it** in the same
 request. That is deliberate: otherwise revoking a compromised token would leave
@@ -259,7 +375,8 @@ curl -sX POST https://<worker>/api/reason \
   }'
 ```
 
-`/api/choice`, `/api/noul`, `/api/score`, `/api/usage`, `/api/whoami` mirror the tools individually.
+`/api/choice`, `/api/noul`, `/api/score`, `/api/usage`, `/api/health-token`, `/api/whoami` mirror the
+tools individually.
 
 
 ## Limits
@@ -280,14 +397,16 @@ src/
   index.ts    router, MCP server, REST mirror, admin API
   oauth.ts    OAuth 2.1 authorization server (DCR, PKCE, consent, revocation)
   auth.ts     credential resolution (master secret → OAuth grant → token hash), admin gate
-  quota.ts    conditional-UPDATE quota + burst limiter, usage snapshot
+  quota.ts    credit pre-flight gate, conditional-UPDATE burst limiter, usage snapshot
+  credits.ts  KD Credit arithmetic, micro-credit scale, health states, debit + ledger
   jev.ts      upstream proxy, question validation, answer normalisation
   admin.ts    dashboard (single page, no build step)
   types.ts    Env and shared shapes
   util.ts     hashing, base32 token generation, constant-time compare
 migrations/
-  0001_init.sql   tokens, usage_events, audit_logs
-  0002_oauth.sql  oauth_clients, oauth_grants, oauth_access_tokens
+  0001_init.sql       tokens, usage_events, audit_logs
+  0002_oauth.sql      oauth_clients, oauth_grants, oauth_access_tokens
+  0003_credits.sql    credit_settings, credit balances, credit_ledger
 docs/
   AGENT-CATALOGUE.md     configurations A–C: orchestrator, planner, swarm, research,
                          tool orchestrator, policy gate, dual expert — with SWOT + SPACE

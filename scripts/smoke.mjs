@@ -55,7 +55,42 @@ async function mcp(token, payload) {
 
 const EMAIL = `smoke-${Date.now()}@example.com`;
 
+/**
+ * Every seat this suite creates is matched by one of these prefixes.
+ *
+ * The cleanup sweep below depends on the pattern staying in sync with the emails
+ * used further down, which is why they are defined once instead of being spelled
+ * out at each call site.
+ */
+const TEST_EMAIL = /^(?:smoke|burst|quota|credit|low|idle|rev|oauth|cascade)-.*@example\.com$/;
+
 console.log(`\n=== KD JEV MCP smoke test -> ${BASE} ===\n`);
+
+// ---------------------------------------------------------------- cleanup
+//
+// Sweep seats left by previous runs FIRST, so the two suites can be run in
+// either order and repeatedly.
+//
+// MAX_USERS defaults to 100 and the combined suites create roughly fifteen seats
+// per run. Without this sweep they slowly consume the operator's seat allowance
+// and then start failing on `seat limit reached` -- a failure that looks like a
+// product bug and is actually the tests' own litter. A suite that can only be run
+// once per database is a broken suite.
+//
+// `sweepTestSeats()` is defined in each suite and matches its own prefixes plus
+// the other's, so running oauth first or smoke first reaches the same clean
+// state. Only addresses matching the pattern are revoked, and only through the
+// normal operator revoke path, so real seats are never touched.
+{
+  const listed = await api("/api/admin/tokens", { admin: PK });
+  const strays = (listed.json?.tokens ?? []).filter((t) => TEST_EMAIL.test(t.email) && t.status === "active");
+  if (strays.length) {
+    for (const t of strays) {
+      await api("/api/admin/tokens", { method: "POST", admin: PK, body: { action: "revoke", email: t.email } });
+    }
+    console.log(`  (swept ${strays.length} test seat(s) left by earlier runs)`);
+  }
+}
 
 // ---------------------------------------------------------------- health
 console.log("health");
@@ -184,9 +219,26 @@ console.log("\nusage");
   const before = await api("/api/usage", { token });
   check("usage returns 200", before.status === 200);
   check("counts calls this period", before.json?.calls_this_period > 0, JSON.stringify(before.json));
-  check("records jev input tokens", before.json?.input_tokens > 0, JSON.stringify(before.json));
-  check("remaining computed", typeof before.json?.remaining === "number");
-  check("quota fields present", before.json?.quota_monthly === 100);
+  check("credit balance present", typeof before.json?.credits?.available === "number", JSON.stringify(before.json));
+  check("credit unit named", before.json?.credits?.unit === "KD Credit");
+  check("credit granted echoed", before.json?.credits?.granted === 500, JSON.stringify(before.json?.credits));
+  check("credit was debited", before.json?.credits?.used > 0, JSON.stringify(before.json?.credits));
+  check("health reported", before.json?.health === "active", JSON.stringify(before.json?.health));
+  check("callable reported", before.json?.callable === true);
+  check("request cap present", before.json?.request_cap === 100, JSON.stringify(before.json?.request_cap));
+
+  // The user-facing surface must never leak a price or a conversion rate. This
+  // is a load-bearing product rule, not cosmetic: the whole point of the credit
+  // abstraction is that the admin can restate rates without touching clients.
+  const raw = JSON.stringify(before.json);
+  check("no MYR on user surface", !/\bmyr\b/i.test(raw), raw.slice(0, 200));
+  check("no USD on user surface", !/\busd\b/i.test(raw), raw.slice(0, 200));
+  check("no micros leaked to user", !/micros/i.test(raw), raw.slice(0, 200));
+
+  const health = await api("/api/health-token", { token });
+  check("health endpoint 200", health.status === 200);
+  check("health verdict active", health.json?.health === "active", JSON.stringify(health.json));
+  check("health carries remedy", typeof health.json?.credits?.available === "number");
 
   const master = await api("/api/usage", { token: MASTER });
   check("master not metered", master.json?.kind === "master", JSON.stringify(master.json));
@@ -207,7 +259,7 @@ console.log("\nMCP protocol");
   const list = await mcp(token, { jsonrpc: "2.0", id: 2, method: "tools/list" });
   const names = (list.json?.result?.tools ?? []).map((t) => t.name).sort();
   check("tools/list 200", list.status === 200, list.text.slice(0, 200));
-  check("all 6 tools exposed", JSON.stringify(names) === JSON.stringify(["choice", "help", "noul", "reason", "score", "usage"]), JSON.stringify(names));
+  check("all 7 tools exposed", JSON.stringify(names) === JSON.stringify(["choice", "help", "noul", "reason", "score", "token_health", "usage"]), JSON.stringify(names));
 
   const call = await mcp(token, {
     jsonrpc: "2.0",
@@ -262,27 +314,118 @@ console.log("\nrate limiting (dedicated token, 3/min)");
   check("429 sends retry-after", !!saw429 && saw429.json?.error?.includes("rate limit"), JSON.stringify(saw429?.json));
 }
 
-// ---------------------------------------------------- quota exhaustion
-console.log("\nquota exhaustion (dedicated token, quota 1)");
+// --------------------------------------------- optional request ceiling
+console.log("\nrequest cap (quota_monthly = 1, an optional secondary ceiling)");
 {
   const email = `quota-${Date.now()}@example.com`;
   const r = await api("/api/admin/tokens", {
     method: "POST",
     admin: PK,
-    body: { action: "create", email, quota_monthly: 1, rate_limit_per_min: 60 },
+    body: { action: "create", email, credits: 100, quota_monthly: 1, rate_limit_per_min: 60 },
   });
   const t = r.json?.token;
+  check("quota echoed on issue", r.json?.quota_monthly === 1, JSON.stringify(r.json?.quota_monthly));
 
   const first = await api("/api/noul", { method: "POST", token: t, body: { state: "hello", instructions: "Is this a greeting?" } });
-  check("first call within quota ok", first.status === 200, `got ${first.status} ${JSON.stringify(first.json).slice(0, 160)}`);
+  check("first call within cap ok", first.status === 200, `got ${first.status} ${JSON.stringify(first.json).slice(0, 160)}`);
 
   const second = await api("/api/noul", { method: "POST", token: t, body: { state: "hello again", instructions: "Is this a greeting?" } });
-  check("second call over quota -> 429", second.status === 429, `got ${second.status} ${JSON.stringify(second.json).slice(0, 160)}`);
+  check("second call over cap -> 429", second.status === 429, `got ${second.status} ${JSON.stringify(second.json).slice(0, 160)}`);
   check("429 says quota_exceeded", second.json?.code === "quota_exceeded", JSON.stringify(second.json));
 
   const u = await api("/api/usage", { token: t });
-  check("usage shows exhausted", u.json?.remaining === 0, JSON.stringify(u.json));
-  check("usage shows 1 of 1 used", u.json?.requests_used === 1 && u.json?.quota_monthly === 1, JSON.stringify(u.json));
+  check("cap surfaced on usage", u.json?.request_cap === 1, JSON.stringify(u.json?.request_cap));
+  check("one call recorded", u.json?.calls_this_period === 1, JSON.stringify(u.json?.calls_this_period));
+
+  // Credits were only spent on the call that actually ran. The blocked call must
+  // not be charged -- otherwise a caller stuck at their ceiling burns their whole
+  // balance on requests that never reached JEV.
+  check("blocked call not charged", u.json?.credits?.used > 0 && u.json?.credits?.used < 5, JSON.stringify(u.json?.credits));
+}
+
+// -------------------------------------------------------- credit exhaustion
+console.log("\ncredit exhaustion (grant 0.01 KD Credit, less than one call costs)");
+{
+  const email = `credit-${Date.now()}@example.com`;
+  const r = await api("/api/admin/tokens", {
+    method: "POST",
+    admin: PK,
+    body: { action: "create", email, credits: 0.01, rate_limit_per_min: 60 },
+  });
+  const t = r.json?.token;
+  check("grant echoed in whole credits", Math.abs((r.json?.credits ?? 0) - 0.01) < 1e-9, JSON.stringify(r.json?.credits));
+  check("grant echoed as money too", typeof r.json?.money?.granted_myr === "number", JSON.stringify(r.json?.money));
+  check("no request cap by default", r.json?.quota_monthly === 0, JSON.stringify(r.json?.quota_monthly));
+
+  const first = await api("/api/noul", { method: "POST", token: t, body: { state: "hello", instructions: "Is this a greeting?" } });
+  check("first call allowed", first.status === 200, `got ${first.status} ${JSON.stringify(first.json).slice(0, 160)}`);
+
+  const second = await api("/api/noul", { method: "POST", token: t, body: { state: "hello again", instructions: "Is this a greeting?" } });
+  check("over balance -> 429", second.status === 429, `got ${second.status} ${JSON.stringify(second.json).slice(0, 160)}`);
+  check("429 says credit_exhausted", second.json?.code === "credit_exhausted", JSON.stringify(second.json));
+  check("429 tells the user to ask for a top-up", /top it up/i.test(second.json?.error ?? ""), JSON.stringify(second.json?.error));
+
+  const u = await api("/api/usage", { token: t });
+  check("health is exhausted", u.json?.health === "exhausted", JSON.stringify(u.json?.health));
+  check("not callable", u.json?.callable === false);
+  check("balance went negative, honestly", u.json?.credits?.available < 0, JSON.stringify(u.json?.credits));
+
+  // The overshoot is the real cost of the call that ran. Clamping it to zero
+  // would make the ledger disagree with the upstream invoice, so the number is
+  // allowed to go below zero and the NEXT call is what gets blocked.
+  check("used exceeds granted (real overspend recorded)", u.json?.credits?.used > 0.01, JSON.stringify(u.json?.credits));
+
+  const h = await api("/api/health-token", { token: t });
+  check("health endpoint agrees", h.json?.health === "exhausted" && h.json?.callable === false, JSON.stringify(h.json));
+
+  // -------------------------------------------------------------- top-up
+  const top = await api("/api/admin/tokens", { method: "POST", admin: PK, body: { action: "topup", email, credits: 50 } });
+  check("topup ok", top.status === 200 && top.json?.added === 50, JSON.stringify(top.json));
+  check("zero topup refused", (await api("/api/admin/tokens", { method: "POST", admin: PK, body: { action: "topup", email, credits: 0 } })).json?.error);
+  check("negative topup refused", (await api("/api/admin/tokens", { method: "POST", admin: PK, body: { action: "topup", email, credits: -5 } })).json?.error);
+  check("topup unknown email refused", (await api("/api/admin/tokens", { method: "POST", admin: PK, body: { action: "topup", email: `ghost-${Date.now()}@example.com`, credits: 5 } })).json?.error);
+
+  const after = await api("/api/usage", { token: t });
+  check("callable again after topup", after.json?.callable === true, JSON.stringify(after.json));
+  check("health back to active", after.json?.health === "active", JSON.stringify(after.json?.health));
+  check("topup landed in extra, not grant", after.json?.credits?.extra === 50 && after.json?.credits?.granted === 0.01, JSON.stringify(after.json?.credits));
+
+  const resumed = await api("/api/noul", { method: "POST", token: t, body: { state: "still here?", instructions: "Is this a question?" } });
+  check("call works after topup", resumed.status === 200, `got ${resumed.status} ${JSON.stringify(resumed.json).slice(0, 160)}`);
+}
+
+// ----------------------------------------------------- degraded (low balance)
+console.log("\ndegraded balance reporting");
+{
+  const email = `low-${Date.now()}@example.com`;
+  const r = await api("/api/admin/tokens", { method: "POST", admin: PK, body: { action: "create", email, credits: 0.5, rate_limit_per_min: 60 } });
+  const t = r.json?.token;
+  // A balance under degraded_pct (20% default) of the grant. Low but not spent.
+  // 'idle' is expected here, not 'active': the seat has never been called, and
+  // conflating that with a working seat would hide a broken integration.
+  const u1 = await api("/api/usage", { token: t });
+  check("fresh seat is idle, not degraded", u1.json?.health === "idle", JSON.stringify(u1.json?.health));
+  check("idle seat is callable", u1.json?.callable === true);
+
+  await api("/api/admin/tokens", { method: "POST", admin: PK, body: { action: "update", email, credits_used: 0.45 } });
+  const u2 = await api("/api/usage", { token: t });
+  check("low balance reads degraded", u2.json?.health === "degraded", JSON.stringify(u2.json));
+  check("degraded is still callable", u2.json?.callable === true, JSON.stringify(u2.json?.callable));
+
+  const call = await api("/api/noul", { method: "POST", token: t, body: { state: "degraded but working", instructions: "Is this a sentence?" } });
+  check("degraded seat can still call", call.status === 200, `got ${call.status}`);
+}
+
+// ------------------------------------------------------- unused-token signal
+console.log("\nidle (generated but never called)");
+{
+  const email = `idle-${Date.now()}@example.com`;
+  const t = (await api("/api/admin/tokens", { method: "POST", admin: PK, body: { action: "create", email, credits: 10 } })).json?.token;
+  const u = await api("/api/usage", { token: t });
+  check("never-used seat reads idle", u.json?.health === "idle", JSON.stringify(u.json?.health));
+  check("idle seat is callable", u.json?.callable === true, JSON.stringify(u.json?.callable));
+  const h = await api("/api/health-token", { token: t });
+  check("idle has a remedy, not just a word", typeof h.json?.credits?.available === "number");
 }
 
 // ------------------------------------------------------------- revocation
@@ -314,6 +457,23 @@ console.log("\nadmin listing");
   check("active counted", r.json?.stats?.active > 0);
   check("no plaintext token in listing", JSON.stringify(r.json.tokens).indexOf("kdj_") === -1, "listing leaked a token!");
   check("usage rollup present", typeof r.json?.stats?.calls_30d === "number");
+  check("credit economy echoed", typeof r.json?.settings?.tokens_per_credit === "number", JSON.stringify(r.json?.settings));
+
+  // This is the mirror image of the "no MYR on user surface" assertion above:
+  // the admin view MUST carry money, or the operator cannot reconcile an invoice.
+  check("stats carry MYR spend", typeof r.json?.stats?.spend_myr_30d === "number", JSON.stringify(r.json?.stats));
+  check("stats carry USD spend", typeof r.json?.stats?.spend_usd_30d === "number", JSON.stringify(r.json?.stats));
+  check("stats carry KD Credit spend", typeof r.json?.stats?.credits_30d === "number", JSON.stringify(r.json?.stats));
+  check("health breakdown counted", typeof r.json?.stats?.exhausted === "number" && typeof r.json?.stats?.degraded === "number", JSON.stringify(r.json?.stats));
+  check("idle seats counted", typeof r.json?.stats?.idle === "number", JSON.stringify(r.json?.stats));
+
+  const row = (r.json?.tokens ?? [])[0];
+  check("row has a health verdict", typeof row?.health === "string", JSON.stringify(row));
+  check("row has a callable flag", typeof row?.callable === "boolean", JSON.stringify(row));
+  check("row has a credit balance", typeof row?.credits?.available === "number", JSON.stringify(row));
+  check("row has MYR available", typeof row?.money?.available_myr === "number", JSON.stringify(row?.money));
+  check("row has USD available", typeof row?.money?.available_usd === "number", JSON.stringify(row?.money));
+  check("row has lifetime JEV tokens", typeof row?.money?.jev_tokens_lifetime === "number", JSON.stringify(row?.money));
 
   const audit = await api("/api/admin/audit?limit=50", { admin: PK });
   check("audit 200", audit.status === 200);
@@ -321,6 +481,37 @@ console.log("\nadmin listing");
   const actions = (audit.json?.logs ?? []).map((l) => l.action);
   check("audit records issuance", actions.includes("token_created"), JSON.stringify(actions.slice(0, 6)));
   check("audit records failed login", actions.includes("admin_login_fail"), JSON.stringify(actions.slice(0, 6)));
+  check("audit records top-ups", actions.includes("token_topped_up"), JSON.stringify(actions.slice(0, 8)));
+}
+
+// --------------------------------------------------------- credit settings
+console.log("\ncredit settings");
+{
+  const g = await api("/api/admin/settings", { admin: PK });
+  check("settings GET 200", g.status === 200);
+  check("settings has rates", typeof g.json?.settings?.myr_micros_per_credit === "number" && typeof g.json?.settings?.usd_micros_per_credit === "number", JSON.stringify(g.json));
+  const original = g.json?.settings;
+
+  check("settings needs the passkey", (await api("/api/admin/settings")).json?.error === "unauthorized");
+  check("bad settings rejected", (await api("/api/admin/settings", { method: "POST", admin: PK, body: { usd_micros_per_credit: 0 } })).json?.error);
+  check("negative settings rejected", (await api("/api/admin/settings", { method: "POST", admin: PK, body: { myr_micros_per_credit: -1 } })).json?.error);
+  check("out-of-range pct rejected", (await api("/api/admin/settings", { method: "POST", admin: PK, body: { degraded_pct: 900 } })).json?.error);
+
+  // tokens_per_credit restates the value of every existing balance, so it is
+  // refused the moment anyone has spent credit. Refusing is the whole point: the
+  // failure mode it prevents is invisible -- a 500-credit grant silently
+  // becoming 250, with every dashboard number still looking plausible.
+  const guard = await api("/api/admin/settings", { method: "POST", admin: PK, body: { tokens_per_credit: 9999 } });
+  check("tokens_per_credit locked after spend", typeof guard.json?.error === "string" && /restate/i.test(guard.json.error), JSON.stringify(guard.json));
+  check("locked rate still unchanged", (await api("/api/admin/settings", { admin: PK })).json?.settings?.tokens_per_credit === original?.tokens_per_credit);
+
+  const upd = await api("/api/admin/settings", { method: "POST", admin: PK, body: { degraded_pct: 35 } });
+  check("degraded_pct saved", upd.json?.settings?.degraded_pct === 35, JSON.stringify(upd.json));
+  const back = await api("/api/admin/settings", { method: "POST", admin: PK, body: { degraded_pct: original.degraded_pct } });
+  check("degraded_pct restored", back.json?.settings?.degraded_pct === original.degraded_pct, JSON.stringify(back.json));
+
+  const aud = await api("/api/admin/audit?limit=50", { admin: PK });
+  check("settings change is audited", (aud.json?.logs ?? []).map((l) => l.action).includes("credit_settings_updated"));
 }
 
 // ------------------------------------------------------------ admin page
@@ -334,6 +525,41 @@ console.log("\nadmin page");
   check("marked noindex", (res.headers.get("x-robots-tag") ?? "") === "noindex");
   check("no-store", (res.headers.get("cache-control") ?? "").includes("no-store"));
   check("does not embed passkey", !html.includes("admk_"));
+
+  // The dashboard is the only surface allowed to show money. If MYR/USD ever
+  // appear in the user-facing payload this page stays the sole place they live,
+  // so assert the page really is where the operator reads them.
+  check("generate form takes KD Credit", html.includes("KD Credit / month"));
+  check("form previews the money", html.includes("JEV spend per month"));
+  check("table shows MYR", html.includes("Available MYR"));
+  check("table shows USD", html.includes("Available USD"));
+  check("table shows health", html.includes(">Health<"));
+  check("top-up action present", html.includes("Top up"));
+  check("credit settings tab present", html.includes("Credit settings"));
+  check("settings warns rates are placeholders", html.includes("actual JEV invoice"));
+
+  // The rate direction is a real bug that shipped once: the dashboard divided
+  // instead of multiplying and printed RM 212.77 for something that costs
+  // RM 0.0047. Off by ~45,000x while looking authoritative. Pin the wording so
+  // the direction has to be stated, not inferred from a bare number.
+  check("rate is stated per credit", html.includes("1 KD Credit"), "settings does not say what the rate is per");
+  check("rate states both directions", html.includes("buys"), "settings does not show the inverse rate");
+  check("rate uses the credit as the base", html.includes("1 KD Credit ("), "settings does not anchor the rate to a credit");
+  check("16px input floor for iOS zoom", !/input,select\{[^}]*font-size:1[0-5]px/.test(html), "an input below 16px will zoom on iOS");
+  check("passkey never written to storage", !/localStorage|sessionStorage/.test(html));
+
+  // Narrow-viewport invariants, verified in a 390px iframe on 2026-10-04: the page
+  // did not overflow, the 9-column table scrolled inside its own container rather
+  // than widening the document, inputs stayed at 16px so iOS would not zoom, and
+  // the grid dropped to 2 columns. CSS assertions only -- they cannot measure.
+  // What they DO catch is a regression that deletes the mechanism, e.g. someone
+  // "fixing" overflow by adding overflow-x:hidden to body, which hides the table
+  // instead of making it reachable.
+  check("has a narrow breakpoint", html.includes("@media(max-width:760px)"), "no mobile breakpoint in the stylesheet");
+  check("wide table lives in a scroll container", /\.tablewrap\{[^}]*overflow-x:auto/.test(html), "table has no overflow-x:auto parent");
+  check("table declares its min width", html.includes("min-width:980px"), "table min-width removed");
+  check("overflow is not papered over", !/overflow-x:hidden/.test(html), "overflow-x:hidden would hide the table rather than contain it");
+  check("inputs meet the iOS 16px floor", !/input,select\{[^}]*font-size:1[0-5]px/.test(html), "an input below 16px will zoom on iOS");
 }
 
 // ------------------------------------------------------------------ done

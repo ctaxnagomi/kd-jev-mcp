@@ -2,7 +2,7 @@
 //
 // Usage: node scripts/oauth.mjs
 //
-// The smoke suite covers the gateway data plane (tokens, quota, JEV primitives).
+// The smoke suite covers the gateway data plane (tokens, credits, JEV primitives).
 // This suite covers the authorization plane that MCP hosts actually walk:
 // discovery -> DCR -> consent -> PKCE exchange -> MCP call -> refresh -> revoke.
 //
@@ -13,7 +13,8 @@
 //   * that the identity check is email AND token, not either alone
 //   * PKCE S256 is enforced (a wrong verifier must not mint tokens)
 //   * an authorization code is single-use
-//   * an OAuth access token really works against /mcp and is charged quota
+//   * an OAuth access token really works against /mcp and is charged against its
+//     holder's credit balance (the OAuth grant is an identity, never a second bill)
 //   * refresh rotates and invalidates the presented refresh token
 //   * revoking a gateway token kills every OAuth session derived from it
 //
@@ -115,7 +116,32 @@ function codeFromRedirect(res) {
 const EMAIL = `oauth-${Date.now()}@example.com`;
 const REDIRECT = "http://127.0.0.1:55999/callback";
 
+/**
+ * Addresses created by EITHER suite. Matching both keeps the two runnable in
+ * either order, repeatedly.
+ *
+ * MAX_USERS defaults to 100 and the two suites together create about fifteen
+ * seats per run, so without a sweep they eat the operator's seat allowance and
+ * then start failing on `seat limit reached` -- which reads like a product bug
+ * and is actually the tests' own litter.
+ */
+const TEST_EMAIL = /^(?:smoke|burst|quota|credit|low|idle|rev|oauth|cascade)-.*@example\.com$/;
+
 console.log(`\n=== KD JEV MCP OAuth 2.1 test -> ${BASE} ===\n`);
+
+/** Revoke seats left behind by earlier runs. Operator path only; real seats are never matched. */
+async function sweepTestSeats() {
+  const listed = await get("/api/admin/tokens", {
+    headers: { "x-admin-passkey": PK || "" },
+  });
+  const strays = (listed.json?.tokens ?? []).filter((t) => TEST_EMAIL.test(t.email) && t.status === "active");
+  for (const t of strays) {
+    await admin({ action: "revoke", email: t.email });
+  }
+  if (strays.length) console.log(`  (swept ${strays.length} test seat(s) left by earlier runs)`);
+  return strays.length;
+}
+await sweepTestSeats();
 
 // ------------------------------------------------------------- discovery
 section("discovery documents");
@@ -156,12 +182,13 @@ let token;
     action: "create",
     email: EMAIL,
     label: "OAuth test",
-    quota_monthly: 50,
+    credits: 500,
     rate_limit_per_min: 60,
   });
   token = r.json?.token;
   check("admin issued a token", r.status === 200 && typeof token === "string", JSON.stringify(r.json).slice(0, 120));
   check("token has the kdj_ prefix", !!token && token.startsWith("kdj_"));
+  check("grant is in KD Credit", r.json?.credits === 500, JSON.stringify(r.json?.credits));
 }
 
 // ------------------------------------------------------- DCR (register)
@@ -443,6 +470,73 @@ let rotatedRefresh;
   check("client_credentials is not offered", badGrant.json?.error === "unsupported_grant_type", JSON.stringify(badGrant.json));
 }
 
+// --------------------------------------------------- OAuth identity = money
+//
+// The property that makes the whole credit model coherent: an OAuth access token
+// is an *identity*, never a second bill. It must draw on its holder's balance, so
+// a user cannot gain capacity by connecting an extra client.
+//
+// Placed BEFORE the revocation section, which is deliberate: revoking a refresh
+// token kills the whole family (asserted below), so after that point every OAuth
+// credential for this account is legitimately dead and these checks would 401 --
+// pass or fail for the wrong reason entirely.
+section("an OAuth session spends its holder's balance, not a new one");
+{
+  // Must be the POST-ROTATION token: the refresh section above deliberately
+  // retired the original access token.
+  check("using the rotated session, not the retired one", typeof rotatedAccess === "string" && rotatedAccess !== accessToken);
+
+  const who = await get("/api/whoami", { headers: { authorization: `Bearer ${token}` } });
+  const directBefore = await get("/api/usage", { headers: { authorization: `Bearer ${token}` } });
+  const viaBefore = await get("/api/usage", { headers: { authorization: `Bearer ${rotatedAccess}` } });
+
+  check("bearer resolves to the holder", who.json?.email === EMAIL, JSON.stringify(who.json));
+  check(
+    "OAuth session resolves too, not just the bearer token",
+    viaBefore.status === 200,
+    `got ${viaBefore.status} ${JSON.stringify(viaBefore.json).slice(0, 120)}`,
+  );
+
+  check(
+    "same balance seen through both credentials",
+    directBefore.json?.credits?.available === viaBefore.json?.credits?.available,
+    `bearer ${directBefore.json?.credits?.available} vs oauth ${viaBefore.json?.credits?.available}`,
+  );
+  check(
+    "same health through both credentials",
+    directBefore.json?.health === viaBefore.json?.health,
+    `${directBefore.json?.health} vs ${viaBefore.json?.health}`,
+  );
+  check(
+    "OAuth session is not separately metered",
+    viaBefore.json?.calls_this_period === directBefore.json?.calls_this_period,
+    `${viaBefore.json?.calls_this_period} vs ${directBefore.json?.calls_this_period}`,
+  );
+
+  // A call made through the OAuth token must move the one shared balance. If
+  // grants were billed separately this would silently double a user's capacity,
+  // which is precisely the bug a metered gateway exists to prevent.
+  const spent = await mcpCall(rotatedAccess, {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: { name: "noul", arguments: { state: "The shared balance question", instructions: "Is this a statement?" } },
+  });
+  check("call via OAuth token succeeds", spent.status === 200, `got ${spent.status}`);
+
+  const directAfter = await get("/api/usage", { headers: { authorization: `Bearer ${token}` } });
+  check(
+    "OAuth spend shows up on the bearer balance",
+    directAfter.json?.credits?.used > directBefore.json?.credits?.used,
+    `${directBefore.json?.credits?.used} -> ${directAfter.json?.credits?.used}`,
+  );
+
+  // The no-prices rule must hold through the second door as well. A credential
+  // path added later is exactly where such a leak would sneak in.
+  const raw = JSON.stringify(viaBefore.json);
+  check("OAuth usage leaks no currency either", !/\bmyr\b/i.test(raw) && !/\busd\b/i.test(raw), raw.slice(0, 160));
+}
+
 // ------------------------------------------------------------ revocation
 section("revocation");
 {
@@ -459,7 +553,7 @@ section("revocation");
 // --------------------------------- gateway revocation kills OAuth sessions
 section("revoking the gateway token kills its OAuth sessions");
 {
-  const r = await admin({ action: "create", email: `cascade-${Date.now()}@example.com`, label: "Cascade", quota_monthly: 10 });
+  const r = await admin({ action: "create", email: `cascade-${Date.now()}@example.com`, label: "Cascade", credits: 10 });
   const cascadeEmail = r.json?.email;
   const cascadeToken = r.json?.token;
 

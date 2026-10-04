@@ -26,7 +26,15 @@ import { z } from "zod";
 
 import type { Env, Question, TokenRow } from "./types";
 import { extractToken, isAdmin, resolveCredential, type Credential } from "./auth";
-import { gateRequest, usageSnapshot } from "./quota";
+import { gateRequest, usageSnapshot, adminMoneyView } from "./quota";
+import {
+  creditBalance,
+  debitCall,
+  isCallable,
+  loadCreditSettings,
+  parseCredits,
+  tokenHealth,
+} from "./credits";
 import {
   JevUpstreamError,
   buildChoice,
@@ -47,7 +55,7 @@ import {
   revokeSessionsForToken,
   unauthorizedChallenge,
 } from "./oauth";
-import { auditRow, envInt, json, normalizeToken, now, randomToken, sha256, uuid } from "./util";
+import { auditRow, envInt, envIntAllowZero, json, normalizeToken, now, randomToken, sha256, uuid } from "./util";
 
 const SERVER_NAME = "kd-jev-mcp";
 const SERVER_VERSION = "1.0.0";
@@ -72,7 +80,11 @@ Tools
             upstream API runs them in parallel, so this is cheaper and faster
             than calling choice/noul/score repeatedly. Prefer this for anything
             beyond a single question.
-  usage     This token's remaining quota, burst headroom, and token spend.
+  usage     This token's KD Credit balance, operational health, and burst headroom.
+  token_health
+            One-word verdict on whether this token can still call: active, idle,
+            degraded, exhausted, or revoked -- with the remedy. Use this when a
+            call fails, to tell a spending problem from a permissions problem.
   help      This text.
 
 Every answer is normalised to {type, value, confidence, probabilities, legend, raw}
@@ -81,7 +93,9 @@ so a client can read one shape regardless of which primitive produced it.
 Composition: ask several narrow questions, then combine the numbers in your own
 code. Broad questions hide several judgements behind one answer.
 
-Authentication is a bearer token. Quota is charged per tool call.`;
+Authentication is a bearer token. Calls are metered in KD Credit, debited by
+the real JEV token usage of each call. The service is free: no price is ever
+stated to a caller.`;
 
 type ToolText = { content: { type: "text"; text: string }[]; isError?: boolean };
 
@@ -134,9 +148,12 @@ async function callJev(
   state: unknown,
   model?: string,
 ): Promise<JevCall> {
+  let creditSettings: Awaited<ReturnType<typeof loadCreditSettings>> | null = null;
+
   if (credential.kind === "token") {
     const gate = await gateRequest(env, credential.token);
     if (!gate.allowed) return { ok: false, status: gate.status, code: gate.code, error: gate.error };
+    creditSettings = gate.settings;
     credential = { kind: "token", token: gate.token };
   }
 
@@ -144,6 +161,20 @@ async function callJev(
   try {
     const raw = await systemOne(env, { state, questions, model });
     const result = normalizeResult(raw);
+
+    // Debit the real cost now that upstream has reported it, rather than
+    // estimating it before the call. Deferred through waitUntil so the caller
+    // does not wait on two accounting writes to get their answer -- the money is
+    // already spent either way. A failure here means the ledger under-reports,
+    // which the next call's pre-flight still catches off credits_used.
+    if (credential.kind === "token" && creditSettings) {
+      ctx.waitUntil(
+        debitCall(env, credential.token, creditSettings, result.usage.input_tokens, result.usage.output_tokens, tool).catch(
+          () => undefined,
+        ),
+      );
+    }
+
     ctx.waitUntil(
       env.DB.prepare(
         `INSERT INTO usage_events (token_id, email, tool, outcome, input_tokens, output_tokens, latency_ms, created_at)
@@ -337,7 +368,8 @@ function buildServer(env: Env, credential: Credential, ctx: ExecutionContext): M
     "usage",
     {
       title: "Token usage",
-      description: "This token's remaining monthly quota, current burst headroom, and lifetime JEV token spend.",
+      description:
+        "This token's KD Credit balance, its operational health, current burst headroom, and call counts. The balance is reported in KD Credit only -- the service is free, and no price or conversion rate is exposed on this surface.",
       inputSchema: {},
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
     },
@@ -345,6 +377,44 @@ function buildServer(env: Env, credential: Credential, ctx: ExecutionContext): M
       if (credential.kind === "master") return ok({ kind: "master", note: "master credential is not metered" });
       try {
         return ok(await usageSnapshot(env, credential.token));
+      } catch (err) {
+        return fail(String(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "token_health",
+    {
+      title: "Token health",
+      description:
+        "One-word verdict on whether this token can still make calls: 'active', 'idle' (never used yet), 'degraded' (low balance), 'exhausted' (no balance), or 'revoked'. Check this when a call fails, to tell a spending problem from a permissions problem.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+    },
+    async () => {
+      if (credential.kind === "master") return ok({ kind: "master", note: "master credential is not metered" });
+      try {
+        const settings = await loadCreditSettings(env);
+        const health = tokenHealth(credential.token, settings);
+        const bal = creditBalance(credential.token);
+        return ok({
+          health,
+          callable: isCallable(health),
+          credits: bal,
+          // Say what to do about it. A verdict without a remedy makes the caller
+          // guess between "wait", "pay", and "ask someone".
+          remedy:
+            health === "revoked"
+              ? "This token has been revoked. Ask an administrator to re-enable it."
+              : health === "exhausted"
+                ? "KD Credit balance exhausted. Ask an administrator to top it up or wait for the next window."
+                : health === "degraded"
+                  ? `Low balance: ${bal.available} of ${bal.granted + bal.extra} KD Credit left. Top up before it runs out.`
+                  : health === "idle"
+                    ? "This token has never been used. If you expected calls, check the client is pointed at the right endpoint."
+                    : "Healthy.",
+        });
       } catch (err) {
         return fail(String(err));
       }
@@ -401,15 +471,43 @@ async function listTokens(env: Env, passkey: string, request: Request): Promise<
   ctxlessAudit(env, request, "admin_login", "viewed token list");
 
   const maxUsers = envInt(env, "MAX_USERS", 100);
+  const settings = await loadCreditSettings(env);
+
   const { results } = await env.DB.prepare(
     `SELECT email, label, status, quota_monthly, requests_used, requests_reset_at,
-            rate_limit_per_min, last_used_at, created_at
+            rate_limit_per_min, last_used_at, created_at,
+            credits_granted, credits_used, credits_extra, jev_tokens_lifetime
        FROM tokens ORDER BY created_at DESC LIMIT 500`,
   )
     .bind()
     .all<Record<string, any>>();
 
-  const tokens = results || [];
+  const rows = results || [];
+
+  // Health and the MYR/USD columns are computed here rather than in SQL so the
+  // conversion arithmetic lives in exactly one place and the dashboard never has
+  // to know the micro-credit scale.
+  const tokens = await Promise.all(
+    rows.map(async (t) => {
+      const token = {
+        ...t,
+        credits_granted: t.credits_granted ?? 0,
+        credits_used: t.credits_used ?? 0,
+        credits_extra: t.credits_extra ?? 0,
+        jev_tokens_lifetime: t.jev_tokens_lifetime ?? 0,
+      } as TokenRow;
+      const health = tokenHealth(token, settings);
+      return {
+        ...(t as Record<string, unknown>),
+        status: token.status,
+        credits: creditBalance(token),
+        health,
+        callable: isCallable(health),
+        money: await adminMoneyView(env, token),
+      };
+    }),
+  );
+
   const active = tokens.filter((t) => t.status === "active").length;
 
   // 30-day usage rollup. Kept in one query so the dashboard is a single round
@@ -421,18 +519,107 @@ async function listTokens(env: Env, passkey: string, request: Request): Promise<
     .bind(now() - 30 * 86_400_000)
     .first<{ calls_30d: number; in_30d: number; out_30d: number }>();
 
+  const jevTokens30d = (usage?.in_30d ?? 0) + (usage?.out_30d ?? 0);
+  const credits30d = settings.tokens_per_credit > 0 ? jevTokens30d / settings.tokens_per_credit : 0;
+
   return {
     tokens,
+    settings,
     stats: {
       total: tokens.length,
       active,
       disabled: tokens.length - active,
+      exhausted: tokens.filter((t) => t.health === "exhausted").length,
+      degraded: tokens.filter((t) => t.health === "degraded").length,
+      idle: tokens.filter((t) => t.health === "idle").length,
       max_users: maxUsers,
       seats_left: Math.max(0, maxUsers - active),
       calls_30d: usage?.calls_30d ?? 0,
-      jev_tokens_30d: (usage?.in_30d ?? 0) + (usage?.out_30d ?? 0),
+      jev_tokens_30d: jevTokens30d,
+      credits_30d: Math.round(credits30d * 1000) / 1000,
+      spend_myr_30d: Math.round(credits30d * (settings.myr_micros_per_credit / 1e6) * 1e4) / 1e4,
+      spend_usd_30d: Math.round(credits30d * (settings.usd_micros_per_credit / 1e6) * 1e4) / 1e4,
     },
   };
+}
+
+/**
+ * Credit economy configuration.
+ *
+ * Editable from the dashboard rather than baked into wrangler vars, because
+ * exchange rates move and an operator should not need a redeploy to restate them.
+ *
+ * `tokens_per_credit` is deliberately refused once any seat has spent credit.
+ * Changing it would silently restate the value of every existing balance -- a
+ * 500-credit grant would quietly become 1000 or 250 overnight -- so making it
+ * easy would be making a data-integrity bug easy.
+ */
+async function adminSettingsAction(
+  env: Env,
+  body: Record<string, any>,
+  passkey: string,
+  request: Request,
+): Promise<Record<string, any>> {
+  if (!isAdmin(env, passkey)) {
+    ctxlessAudit(env, request, "admin_login_fail", "failed settings update attempt");
+    return { error: "unauthorized" };
+  }
+
+  const sets: string[] = [];
+  const binds: any[] = [];
+
+  const put = (column: string, value: unknown, label: string, opts: { min?: number; max?: number } = {}) => {
+    const v = Number(value);
+    const min = opts.min ?? 0;
+    const max = opts.max ?? Number.MAX_SAFE_INTEGER;
+    if (!Number.isFinite(v) || v < min || v > max) return `${label} must be a number in [${min}, ${max}]`;
+    sets.push(`${column} = ?`);
+    binds.push(Math.floor(v));
+    return null;
+  };
+
+  if (body.myr_micros_per_credit !== undefined) {
+    const err = put("myr_micros_per_credit", body.myr_micros_per_credit, "myr_micros_per_credit", { min: 1 });
+    if (err) return { error: err };
+  }
+  if (body.usd_micros_per_credit !== undefined) {
+    const err = put("usd_micros_per_credit", body.usd_micros_per_credit, "usd_micros_per_credit", { min: 1 });
+    if (err) return { error: err };
+  }
+  if (body.degraded_pct !== undefined) {
+    const err = put("degraded_pct", body.degraded_pct, "degraded_pct", { max: 100 });
+    if (err) return { error: err };
+  }
+  if (body.default_credits !== undefined) {
+    const err = put("default_credits", body.default_credits, "default_credits");
+    if (err) return { error: err };
+  }
+  if (body.tokens_per_credit !== undefined) {
+    const spent = await env.DB.prepare("SELECT COUNT(*) AS c FROM tokens WHERE jev_tokens_lifetime > 0")
+      .bind()
+      .first<{ c: number }>();
+    if ((spent?.c ?? 0) > 0) {
+      return {
+        error:
+          "tokens_per_credit cannot be changed once seats have spent credit -- it would silently restate the " +
+          "value of every existing balance. Change it deliberately in D1 once you accept that.",
+      };
+    }
+    const err = put("tokens_per_credit", body.tokens_per_credit, "tokens_per_credit", { min: 1 });
+    if (err) return { error: err };
+  }
+
+  if (!sets.length) return { ok: true, settings: await loadCreditSettings(env) };
+
+  sets.push("updated_at = ?");
+  binds.push(now());
+  await env.DB.prepare(`UPDATE credit_settings SET ${sets.join(", ")} WHERE id = 1`).bind(...binds).run();
+
+  await auditRow(env, "admin", "credit_settings_updated", JSON.stringify(body).slice(0, 200), request)
+    .run()
+    .catch(() => undefined);
+
+  return { ok: true, settings: await loadCreditSettings(env) };
 }
 
 /**
@@ -507,10 +694,10 @@ async function adminTokensAction(
     if (!email || email.length < 3 || !email.includes("@")) return { error: "a valid email is required" };
 
     const existing = await env.DB.prepare(
-      "SELECT id, status, quota_monthly, rate_limit_per_min FROM tokens WHERE email = ?",
+      "SELECT id, status, quota_monthly, rate_limit_per_min, credits_granted, credits_extra FROM tokens WHERE email = ?",
     )
       .bind(email)
-      .first<{ id: string; status: string; quota_monthly: number; rate_limit_per_min: number }>();
+      .first<{ id: string; status: string; quota_monthly: number; rate_limit_per_min: number; credits_granted: number; credits_extra: number }>();
 
     // Re-issuing for an existing holder does not consume a new seat, so the cap
     // only applies when a genuinely new person is added.
@@ -529,10 +716,20 @@ async function adminTokensAction(
     // A rotation replaces the secret, not the holder's allowance. Falling back to
     // the server default would silently reset someone's quota at the exact
     // moment they lost a token, so an existing row supplies the fallback.
-    const fallbackQuota = existing?.quota_monthly ?? envInt(env, "DEFAULT_QUOTA_MONTHLY", 1000);
+    const fallbackQuota = existing?.quota_monthly ?? envIntAllowZero(env, "DEFAULT_QUOTA_MONTHLY", 0);
     const fallbackRate = existing?.rate_limit_per_min ?? envInt(env, "DEFAULT_RATE_PER_MIN", 60);
+    const settings = await loadCreditSettings(env);
 
-    const quota = Number.isFinite(Number(body.quota_monthly)) && Number(body.quota_monthly) > 0
+    // KD Credit is the allowance the operator thinks in, so it is what the
+    // generate form asks for. A rotation keeps the holder's existing grant rather
+    // than resetting it -- losing a token should not also cost someone their
+    // balance.
+    const requestedCredits = parseCredits(body.credits);
+    const fallbackCreditsMicro =
+      existing != null ? existing.credits_granted : settings.default_credits * 1_000_000;
+    const creditsMicro = requestedCredits != null && body.credits !== undefined ? requestedCredits : fallbackCreditsMicro;
+
+    const quota = Number.isFinite(Number(body.quota_monthly)) && Number(body.quota_monthly) >= 0
       ? Math.min(1_000_000, Math.floor(Number(body.quota_monthly)))
       : fallbackQuota;
     const rate = Number.isFinite(Number(body.rate_limit_per_min)) && Number(body.rate_limit_per_min) > 0
@@ -545,26 +742,29 @@ async function adminTokensAction(
     const periodMs = envInt(env, "QUOTA_PERIOD_DAYS", 30) * 86_400_000;
 
     if (existing) {
-      // Rotation resets the meter: the new holder starts from a clean window
-      // rather than inheriting the previous one's usage.
+      // Rotation replaces the secret, not the holder's allowance. It resets the
+      // window so the new holder starts clean, but credits_extra survives --
+      // top-ups are not secret material and must not be lost to a rotation.
       await env.DB.prepare(
         `UPDATE tokens
             SET token_hash = ?, status = 'active', label = COALESCE(?, label),
                 quota_monthly = ?, rate_limit_per_min = ?,
+                credits_granted = ?, credits_used = 0,
                 requests_used = 0, requests_reset_at = ?,
                 rate_window = 0, rate_count = 0, updated_at = ?
           WHERE id = ?`,
       )
-        .bind(hash, label, quota, rate, t + periodMs, t, existing.id)
+        .bind(hash, label, quota, rate, creditsMicro, t + periodMs, t, existing.id)
         .run();
     } else {
       await env.DB.prepare(
         `INSERT INTO tokens
            (id, email, label, token_hash, status, quota_monthly, requests_used, requests_reset_at,
-            rate_limit_per_min, rate_window, rate_count, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'active', ?, 0, ?, ?, 0, 0, ?, ?)`,
+            rate_limit_per_min, rate_window, rate_count, credits_granted, credits_used, credits_extra,
+            jev_tokens_lifetime, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'active', ?, 0, ?, ?, 0, 0, ?, 0, 0, 0, ?, ?)`,
       )
-        .bind(uuid(), email, label, hash, quota, t + periodMs, rate, t, t)
+        .bind(uuid(), email, label, hash, quota, t + periodMs, rate, creditsMicro, t, t)
         .run();
     }
 
@@ -572,7 +772,42 @@ async function adminTokensAction(
       .run()
       .catch(() => undefined);
 
-    return { ok: true, action, email, token, quota_monthly: quota, rate_limit_per_min: rate, label };
+    return {
+      ok: true,
+      action,
+      email,
+      token,
+      credits: creditsMicro / 1_000_000,
+      money: await adminMoneyView(
+        env,
+        { credits_granted: creditsMicro, credits_used: 0, credits_extra: 0, jev_tokens_lifetime: 0 } as TokenRow,
+      ),
+      quota_monthly: quota,
+      rate_limit_per_min: rate,
+      label,
+    };
+  }
+
+  if (action === "topup") {
+    if (!email) return { error: "email is required" };
+    const micro = parseCredits(body.credits);
+    if (micro == null) return { error: "credits must be a non-negative number" };
+    if (micro === 0) return { error: "credits must be greater than zero" };
+
+    // credits_extra, not credits_granted: a top-up must survive the next window
+    // reset. Adding it to the grant would look identical today and silently
+    // disappear in a month, which is how operators lose trust in a balance.
+    const res = await env.DB.prepare(
+      "UPDATE tokens SET credits_extra = credits_extra + ?, updated_at = ? WHERE email = ?",
+    )
+      .bind(micro, t, email)
+      .run();
+    if (!res.meta?.changes) return { error: `no token found for ${email}` };
+
+    await auditRow(env, "admin", "token_topped_up", `${email} +${micro / 1_000_000} KD Credit`, request)
+      .run()
+      .catch(() => undefined);
+    return { ok: true, action, email, added: micro / 1_000_000 };
   }
 
   if (action === "revoke" || action === "enable") {
@@ -610,6 +845,18 @@ async function adminTokensAction(
       if (!Number.isFinite(r) || r < 0) return { error: "rate_limit_per_min must be a non-negative number" };
       sets.push("rate_limit_per_min = ?");
       binds.push(Math.floor(r));
+    }
+    if (body.credits_granted !== undefined) {
+      const c = parseCredits(body.credits_granted);
+      if (c == null) return { error: "credits_granted must be a non-negative number" };
+      sets.push("credits_granted = ?");
+      binds.push(c);
+    }
+    if (body.credits_used !== undefined) {
+      const c = parseCredits(body.credits_used);
+      if (c == null) return { error: "credits_used must be a non-negative number" };
+      sets.push("credits_used = ?");
+      binds.push(c);
     }
     if (body.label !== undefined) {
       sets.push("label = ?");
@@ -677,6 +924,20 @@ async function handleRest(
       case "/api/usage":
         if (credential.kind !== "token") return json({ kind: "master", note: "master credential is not metered" }, { headers: CORS });
         return json(await usageSnapshot(env, credential.token), { headers: CORS });
+      case "/api/health-token":
+        if (credential.kind !== "token") return json({ kind: "master", note: "master credential is not metered" }, { headers: CORS });
+        {
+          const settings = await loadCreditSettings(env);
+          const health = tokenHealth(credential.token, settings);
+          return json(
+            {
+              health,
+              callable: isCallable(health),
+              credits: creditBalance(credential.token),
+            },
+            { headers: CORS },
+          );
+        }
       case "/api/whoami":
         if (credential.kind !== "token") return json({ kind: "master" }, { headers: CORS });
         return json(
@@ -786,18 +1047,28 @@ export default {
     }
 
     // ---------------------------------------------------------------- admin API
-    if (path === "/api/admin/tokens" || path === "/api/admin/audit" || path === "/api/admin/grants") {
+    if (path === "/api/admin/tokens" || path === "/api/admin/audit" || path === "/api/admin/grants" || path === "/api/admin/settings") {
       const body = request.method === "POST" ? ((await request.json().catch(() => ({}))) as Record<string, any>) : {};
       const passkey = adminPasskey(request, body);
-      if (path === "/api/admin/tokens" && request.method === "POST") {
+      if (request.method === "POST" && path === "/api/admin/tokens") {
         return adminJson(await adminTokensAction(env, body, passkey, request));
       }
+      if (request.method === "POST" && path === "/api/admin/settings") {
+        return adminJson(await adminSettingsAction(env, body, passkey, request));
+      }
+      // NOTE: every GET below runs through a passkey check. The settings read is
+      // routed through adminSettingsAction (an empty body is a no-op read) rather
+      // than inlined, precisely so there is one code path that can serve the
+      // rates -- and therefore one place to forget the check. An earlier version
+      // returned them raw here and leaked the credit economy to anyone who asked.
       return adminJson(
         path === "/api/admin/tokens"
           ? await listTokens(env, passkey, request)
           : path === "/api/admin/grants"
             ? await listGrants(env, passkey)
-            : await adminAudit(env, passkey, url, request),
+            : path === "/api/admin/settings"
+              ? await adminSettingsAction(env, {}, passkey, request)
+              : await adminAudit(env, passkey, url, request),
       );
     }
 

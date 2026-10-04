@@ -90,6 +90,22 @@ export function envInt(env: Env, key: keyof Env, fallback: number): number {
 }
 
 /**
+ * Same, but where zero is a MEANINGFUL value rather than "unset".
+ *
+ * `envInt` treats 0 as absent, which is right for a rate limit (0 requests/minute
+ * is nonsense) and wrong for a request cap (0 = "no cap"). Using `envInt` there
+ * meant DEFAULT_QUOTA_MONTHLY="0" silently fell back to 1000 and quietly
+ * re-imposed the exact ceiling an operator had switched off -- the setting read
+ * as configured in wrangler.jsonc and behaved otherwise, which is the worst kind
+ * of config bug to debug.
+ */
+export function envIntAllowZero(env: Env, key: keyof Env, fallback: number): number {
+  const raw = env[key];
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+
+/**
  * Append-only operator audit row.
  *
  * Returns the prepared statement rather than running it so callers can batch

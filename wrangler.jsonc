@@ -40,11 +40,24 @@
     "MAX_USERS": "100",
 
     // Default allowance applied to newly generated tokens.
-    "DEFAULT_QUOTA_MONTHLY": "1000",
+    //
+    // DEFAULT_QUOTA_MONTHLY is now an OPTIONAL secondary ceiling, not the spend
+    // control: 0 means "no request cap", and the KD Credit balance is the only
+    // limit. The two controls have distinct jobs — the rate limiter caps the
+    // instantaneous burst, the credit balance caps total spend — and a third
+    // overlapping limit only confuses which one bit.
+    "DEFAULT_QUOTA_MONTHLY": "0",
     "DEFAULT_RATE_PER_MIN": "60",
 
-    // Length of a quota period in days. Quota is reset lazily on first use
-    // after the window elapses, so no cron is required.
+    // Recurring KD Credit grant for a new seat. Overridden per token by the
+    // generate form, and the dashboard default lives in credit_settings so it
+    // can be changed without a redeploy. This var is the last-resort fallback
+    // when that row is unreadable.
+    "DEFAULT_CREDITS": "500",
+
+    // Length of a quota period in days. The credit grant and the request
+    // counter reset together, lazily on first use after the window elapses,
+    // so no cron is required. Top-ups (credits_extra) never reset.
     "QUOTA_PERIOD_DAYS": "30"
   }
 }

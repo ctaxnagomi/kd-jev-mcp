@@ -7,7 +7,8 @@ export type Credential =
 
 const TOKEN_COLUMNS = `id, email, label, token_hash, status, quota_monthly, requests_used,
                        requests_reset_at, rate_limit_per_min, rate_window, rate_count,
-                       last_used_at, created_at, updated_at`;
+                       last_used_at, created_at, updated_at,
+                       credits_granted, credits_used, credits_extra, jev_tokens_lifetime`;
 
 /** The same projection, qualified with `t.` for the OAuth lookup's join. */
 const TOKEN_COLUMNS_T = TOKEN_COLUMNS.split(",")
